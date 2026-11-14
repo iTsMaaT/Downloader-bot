@@ -1,0 +1,32 @@
+const { ApplicationCommandType } = require("discord.js");
+const formatDuration = require("@utils/functions/formatDuration");
+
+module.exports = {
+    name: "ping",
+    description: "Shows bot latency",
+    type: ApplicationCommandType.ChatInput,
+
+    /**
+     * @param {import("@utils/log")} logger The logger instance for logging errors and warnings
+     * @param {import("discord.js").ChatInputCommandInteraction} interaction The interaction that triggered the command
+     * @param {import("discord.js").Client} client The Discord client instance
+     * @returns {Promise<void>}
+     */
+    async execute(logger, interaction, client) {
+        const sent = await interaction.editReply({ content: "Pinging..." });
+
+        const pingEmbed = {
+            title: "Ping Information",
+            color: 0xffffff, 
+            fields: [
+                { name: "Bot's Ping", value: `\`${client.ws.ping.toFixed(2)}ms\`` },
+                { name: "Uptime", value: `\`${formatDuration(client.uptime)}\`` },
+                { name: "Round Trip Latency", value: `\`${sent.createdTimestamp - interaction.createdTimestamp}ms\`` },
+                { name: "Bot's Age", value: `<t:${Math.floor(client.user.createdTimestamp / 1000)}:R>` },
+            ],
+            timestamp: new Date(),
+        };
+
+        await sent.edit({ embeds: [pingEmbed] });
+    },
+};

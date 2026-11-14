@@ -1,0 +1,42 @@
+const logger = require("@utils/log");
+const { version, repository } = require("@root/package.json");
+
+/**
+ * Check if the application version is up to date between github and package.json
+ * @returns {void}
+ */
+const checkGitHubVersion = async function() {
+    if (!repository || !repository.url) {
+        logger.severe("GitHub repository URL not found in package.json. Cannot check version.");
+        return;
+    }
+    logger.debug("Checking application version compared to GitHub...");
+    const repoUrlArray = repository.url.split("/");
+    const repoIdentifier = `${repoUrlArray[3]}/${repoUrlArray[4].split(".")[0]}`;
+    const result = await (await fetch(`https://api.github.com/repos/${repoIdentifier}/contents/package.json`)).json();
+    if (result?.message?.includes("No server is currently available to service your request")) return logger.severe("GitHub API is currently unavailable. Cannot check version.");
+    const githubVersion = JSON.parse(Buffer.from(result.content, "base64").toString("utf-8")).version; 
+    logger.debug(`Current version is ${version}`);
+
+    const parse = v => v.split(/[-+]/)[0].split(".").map(n => parseInt(n, 10) || 0);
+    const isNewer = (a, b) => {
+        const pa = parse(a), pb = parse(b);
+        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+            const diff = (pa[i] || 0) - (pb[i] || 0);
+            if (diff !== 0) return diff > 0;
+        }
+        return false;
+    };
+
+    // A local version higher than GitHub's means it's awaiting a push
+    if (isNewer(githubVersion, version)) {
+        logger.warning(`New version available: ${githubVersion}`);
+        logger.warning(`You are currently using version: ${version}`);
+        if (githubVersion.split(".")[0] !== version.split(".")[0]) logger.severe("Major version mismatch");
+        logger.warning("Please consider updating the application with 'git pull'.");
+    }
+
+    logger.info("Successfully checked application version.");
+};
+
+module.exports = { execute: checkGitHubVersion };

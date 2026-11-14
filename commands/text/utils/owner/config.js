@@ -1,0 +1,167 @@
+const embedGenerator = require("@utils/helpers/embedGenerator");
+const { createPaginatedMessage } = require("@utils/helpers/createPaginatedMessage");
+const config = require("@utils/config/configUtils");
+
+module.exports = {
+    name: "config",
+    description: "Manage the current configuration",
+    category: "owner",
+    private: true,
+
+    /**
+     * @param {import("@utils/log")} logger The logger instance for logging errors and warnings
+     * @param {import("discord.js").Client} client The Discord client instance
+     * @param {import("discord.js").Message} message The message object that triggered the command
+     * @param {string[]} args The command arguments
+     * @param {Object} flags The command flags
+     * @returns {Promise<void>}
+     */
+    async execute(logger, client, message, args, flags) {
+        const subCommand = args[0];
+        const key = args[1];
+        const value = args.slice(2).join(" ");
+
+        // eslint-disable-next-line no-shadow
+        const formatValue = (value, depth = 0) => {
+            if (depth > 3) return "[Maximum nesting depth reached]";
+            if (typeof value === "object" && value !== null) {
+                if (Array.isArray(value)) {
+                    return value.length > 3 
+                        ? `[${value.slice(0, 3).map(v => formatValue(v, depth + 1)).join(", ")}...] (${value.length} items)`
+                        : `[${value.map(v => formatValue(v, depth + 1)).join(", ")}]`;
+                }
+                const entries = Object.entries(value);
+                const indent = "  ".repeat(depth);
+                const formattedEntries = entries.slice(0, 3).map(([k, v]) => 
+                    `${indent}${k}: ${formatValue(v, depth + 1)}`,
+                ).join("\n");
+                return entries.length > 3
+                    ? `{\n${formattedEntries}\n${indent}...(${entries.length} properties)}`
+                    : `{\n${formattedEntries}\n${indent}}`;
+            }
+            if (typeof value === "string") return `"${value}"`;
+            if (typeof value === "undefined") return "undefined";
+            if (value === null) return "null";
+            return String(value);
+        };
+
+        const createConfigEmbed = (title, description) => ({
+            title,
+            color: 0xffffff,
+            description,
+            timestamp: new Date(),
+        });
+
+        const createFields = (configObj) => {
+            const fields = [];
+             
+            // eslint-disable-next-line no-shadow
+            for (const [key, value] of Object.entries(configObj)) {
+                const formattedValue = formatValue(value);
+                if (formattedValue.length > 1000) {
+                    const chunks = formattedValue.match(/.{1,1000}/g) || [];
+                    chunks.forEach((chunk, index) => {
+                        fields.push({
+                            name: index === 0 ? `📝 ${key}` : `📝 ${key} (continued)`,
+                            value: `\`\`\`js\n${chunk}\`\`\``,
+                            inline: false,
+                        });
+                    });
+                } else {
+                    fields.push({
+                        name: `📝 ${key}`,
+                        value: `\`\`\`js\n${formattedValue}\`\`\``,
+                        inline: false,
+                    });
+                }
+            }
+            return fields;
+        };
+
+        switch (subCommand) {
+            case "getall": {
+                const allConfig = config.getAll();
+                const configEmbed = createConfigEmbed("Configuration", "The current configuration");
+                const fields = createFields(allConfig);
+                await createPaginatedMessage(message, { embed: configEmbed, fields, fieldsPerPage: 5 });
+                break;
+            }
+            case "get": {
+                const configValue = config.get(key);
+                const configEmbed = createConfigEmbed("Configuration", `Value for key: ${key}`);
+                const fields = createFields({ [key]: configValue });
+                await createPaginatedMessage(message, { embed: configEmbed, fields, fieldsPerPage: 5 });
+                break;
+            }
+            case "set": {
+                // Match the existing value's type so arrays (whitelists/blacklists) don't become strings
+                const current = config.get(key);
+                let parsed = value;
+                if (Array.isArray(current)) {
+                    try {
+                        const json = JSON.parse(value);
+                        parsed = Array.isArray(json) ? json : null;
+                    } catch {
+                        parsed = value.split(",").map(s => s.trim()).filter(Boolean);
+                    }
+                } else if (typeof current === "boolean") {
+                    parsed = value.trim().toLowerCase() === "true" ? true : value.trim().toLowerCase() === "false" ? false : null;
+                } else if (typeof current === "number") {
+                    parsed = value.trim() !== "" && !Number.isNaN(Number(value)) ? Number(value) : null;
+                }
+                if (parsed === null) {
+                    return await message.reply({
+                        embeds: [embedGenerator.error(`Invalid value for **${key}**: expected ${Array.isArray(current) ? "array" : typeof current}`)],
+                    });
+                }
+                config.set(key, parsed);
+                const configEmbed = createConfigEmbed("Configuration", `Set value for key: ${key}`);
+                configEmbed.fields = createFields({ [key]: parsed });
+                await message.reply({ embeds: [configEmbed] });
+                break;
+            }
+            case "reset": {
+                config.reset(key);
+                const configEmbed = createConfigEmbed("Configuration", `Reset value for key: ${key}`);
+                await message.reply({ embeds: [configEmbed] });
+                break;
+            }
+            case "resetall": {
+                config.resetAll();
+                const configEmbed = createConfigEmbed("Configuration", "Reset all configuration values");
+                await message.reply({ embeds: [configEmbed] });
+                break;
+            }
+            case "has": {
+                const hasKey = config.has(key);
+                const configEmbed = createConfigEmbed("Configuration", `**${key}** ${hasKey ? "exists" : "does not exist"}`);
+                await message.reply({ embeds: [configEmbed] });
+                break;
+            }
+            case "delete": {
+                config.delete(key);
+                const configEmbed = createConfigEmbed("Configuration", `Deleted key: ${key}`);
+                await message.reply({ embeds: [configEmbed] });
+                break;
+            }
+            case "help": {
+                const configEmbed = createConfigEmbed("Configuration", "Subcommands:\n```\n" + 
+                    "getall: Get all configuration keys\n" +
+                    "get <key>: Get the value of a specific configuration key\n" +
+                    "set <key> <value>: Set the value of a specific configuration key\n" +
+                    "reset <key>: Reset the value of a specific configuration key\n" +
+                    "resetall: Reset all configuration keys\n" +
+                    "has <key>: Check if a specific configuration key exists\n" +
+                    "delete <key>: Delete a specific configuration key\n" +
+                    "```");
+                await message.reply({ embeds: [configEmbed] });
+                break;
+            }
+            default: {
+                const configEmbed = createConfigEmbed("Configuration", "Invalid subcommand");
+                await message.reply({ embeds: [configEmbed] });
+                break;
+            }
+        }
+    },
+};

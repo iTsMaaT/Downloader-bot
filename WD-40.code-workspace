@@ -1,0 +1,27 @@
+{
+    "folders": [
+        {
+            "path": "."
+        }
+    ],
+    "settings": {
+        "[javascript]": {
+            "editor.defaultFormatter": "vscode.typescript-language-features",
+            //"editor.formatOnSave": true,
+        },
+        //"eslint.format.enable": true,
+        "editor.codeActionsOnSave": {
+            "source.fixAll.eslint": "explicit"
+        },
+        "githubPullRequests.ignoredPullRequestBranches": [
+            "develop"
+        ],
+        //"eslint.options": {
+        //    "overrideConfigFile": "eslint.config.mjs"
+        //},
+        //"eslint.lintTask.enable": true,
+        //"eslint.codeActionsOnSave.rules": [
+        //    "explicit"
+        //],
+    }
+}

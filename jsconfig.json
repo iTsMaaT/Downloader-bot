@@ -1,0 +1,13 @@
+{
+    "compilerOptions": {
+        "paths": {
+        "@root/*": ["./*"],
+        "@functions/*": ["./utils/functions/*"],
+        "@utils/*": ["./utils/*"],
+        "@config/*": ["./utils/config/*"],
+        "@guildManager": ["./utils/guildManager/guildManager.js"],
+      }
+    },
+    "include": ["./**/*"]
+  }
+  

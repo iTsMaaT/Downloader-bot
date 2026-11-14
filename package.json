@@ -1,0 +1,68 @@
+{
+  "name": "wd40",
+  "version": "5.12.5",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node --openssl-legacy-provider --no-deprecation index.js",
+    "start:dev": "node --openssl-legacy-provider --trace-deprecation --trace-warnings index.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "lint": "npx eslint --no-fix .",
+    "drizzle:generate": "npx drizzle-kit generate:pg --out ./utils/db/ --schema ./schema/schema.js",
+    "drizzle:push": "npx drizzle-kit push:mysql --config=drizzle-cli-conf.js",
+    "code": "git pull && npm i && code WD-40.code-workspace && eslint --no-fix . && npm run cl",
+    "c": "npm run code",
+    "createChangelogMD": "node ./utils/helpers/createChangelogMD.js",
+    "cl": "npm run createChangelogMD",
+    "generateChangelogEntry": "node ./utils/helpers/generateChangelogEntry.js",
+    "gce": "npm run generateChangelogEntry",
+    "updateall": "npx npm-check-updates -u && npm i"
+  },
+  "author": "iTsMaaT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iTsMaaT/Downloader-bot"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@discord-player/extractor": "^7.2.0",
+    "@google/genai": "^2.24.0",
+    "@napi-rs/canvas": "^1.0.9",
+    "axios": "^1.20.0",
+    "bgutils-js": "^4.0.3",
+    "chart.js": "^4.5.1",
+    "cron": "^4.4.0",
+    "discord-player": "^7.2.0",
+    "discord-player-applemusic": "^1.0.3",
+    "discord-player-deezer": "^2.6.0",
+    "discord-player-soundcloud": "^1.0.7",
+    "discord-player-soundgasm": "^1.1.5",
+    "discord-player-spotify": "^1.1.9",
+    "discord-player-subsonic": "^1.0.1",
+    "discord-player-youtubei": "^3.1.0",
+    "discord-voip": "^7.2.0",
+    "discord.js": "^14.27.0",
+    "dotenv": "^17.4.2",
+    "googlevideo": "^4.1.1",
+    "jsdom": "^29.0.1",
+    "module-alias": "^2.3.4",
+    "node-html-parser": "^8.0.4",
+    "sharp": "^0.35.4",
+    "simple-ytdl-core": "^1.1.1",
+    "youtube-dl-exec": "^3.1.15",
+    "youtubei.js": "^17.2.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "drizzle-kit": "^0.31.11",
+    "eslint": "^10.11.0",
+    "globals": "^17.12.0"
+  },
+  "_moduleAliases": {
+    "@root": ".",
+    "@functions": "./utils/functions",
+    "@utils": "./utils",
+    "@config": "./utils/config",
+    "@guildManager": "./utils/guildManager/guildManager.js"
+  }
+}

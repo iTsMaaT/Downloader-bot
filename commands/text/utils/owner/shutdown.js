@@ -1,0 +1,76 @@
+const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require("discord.js");
+
+module.exports = {
+    name: "shutdown",
+    description: "Shuts down the bot from discord",
+    category: "owner",
+    usage: {
+        required: {
+            "reason": "reason for shutdown",
+        },
+    },
+    private: true,
+
+    /**
+     * @param {import("@utils/log")} logger The logger instance for logging errors and warnings
+     * @param {import("discord.js").Client} client The Discord client instance
+     * @param {import("discord.js").Message} message The message object that triggered the command
+     * @param {string[]} args The command arguments
+     * @param {Object} flags The command flags
+     * @returns {Promise<void>}
+     */
+    async execute(logger, client, message, args, flags) {
+        const server = process.env.SERVER;
+
+        const YesRestart = new ButtonBuilder()
+            .setCustomId("yes")
+            .setLabel("Yes")
+            .setStyle(ButtonStyle.Success);
+
+        const NoRestart = new ButtonBuilder()
+            .setCustomId("no")
+            .setLabel("No")
+            .setStyle(ButtonStyle.Danger);
+
+        const row = new ActionRowBuilder()
+            .addComponents(YesRestart, NoRestart);
+
+        const embed = {
+            color: 0xffff00,
+            description: `The bot is currently playing in **${client.voice.adapters.size}** VCs, are you sure you want to shutdown [**${server}**]?`,
+            timestamp: new Date(),
+        };
+
+        const ConfirmationMessage = await message.reply({
+            embeds: [embed],
+            components: [row],
+        });
+
+        try {
+            const interaction = await ConfirmationMessage.awaitMessageComponent({
+                filter: (inter) => inter.user.id === message.author.id,
+                time: 15000,
+            });
+
+            if (interaction.customId === "yes") {
+                embed.description = "Shutting down the bot...";
+                embed.color = 0xff0000;
+                await ConfirmationMessage.edit({ embeds: [embed], components: [row] });
+
+                logger.warning("Shutdown requested from discord");
+
+                setTimeout(() => process.exit(0), 3000);
+            } else if (interaction.customId === "no") {
+                embed.description = "Shutdown cancelled";
+                embed.color = 0xffffff;
+                await ConfirmationMessage.edit({ embeds: [embed], components: [row] });
+            }
+            
+            row.components.forEach((component) => component.setDisabled(true));
+            await interaction.update({ components: [row] });
+        } catch (error) {
+            row.components.forEach((component) => component.setDisabled(true));
+            await ConfirmationMessage.edit({ components: [row], embeds: [embed] });
+        }
+    },
+};
