@@ -8,6 +8,8 @@
     A Discord bot that searches for songs and sends them to you as MP3 files.
     <br>
     Based on <a href="https://github.com/iTsMaaT/WD-40">WD-40</a>.
+    <br>
+    <a href="https://itsmaat.github.io/Downloader-bot/PRIVACY.html">Privacy Policy</a>
 </p>
 
 <br>
