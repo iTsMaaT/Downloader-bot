@@ -44,7 +44,6 @@
     "discord-voip": "^7.2.0",
     "discord.js": "^14.27.0",
     "dotenv": "^17.4.2",
-    "googlevideo": "^4.1.1",
     "jsdom": "^29.0.1",
     "module-alias": "^2.3.4",
     "node-html-parser": "^8.0.4",

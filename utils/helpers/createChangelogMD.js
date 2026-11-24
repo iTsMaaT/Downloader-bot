@@ -10,7 +10,8 @@ const packageJson = require("@root/package.json");
  * @returns {string} The formatted date string.
  */
 const formatDate = (dateString) => {
-    const options = { year: "numeric", month: "long", day: "numeric" };
+    // "YYYY-MM-DD" is parsed as UTC midnight, format it in UTC too or it shows the day before west of UTC
+    const options = { year: "numeric", month: "long", day: "numeric", timeZone: "UTC" };
     return new Date(dateString).toLocaleDateString(undefined, options);
 };
 
