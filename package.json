@@ -1,6 +1,6 @@
 {
-  "name": "wd40",
-  "version": "5.12.5",
+  "name": "downloader-bot",
+  "version": "1.3.0",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -29,6 +29,7 @@
     "@google/genai": "^2.24.0",
     "@napi-rs/canvas": "^1.0.9",
     "axios": "^1.20.0",
+    "better-sqlite3": "^13.2.0",
     "bgutils-js": "^4.0.3",
     "chart.js": "^4.5.1",
     "cron": "^4.4.0",
@@ -49,6 +50,7 @@
     "node-html-parser": "^8.0.4",
     "sharp": "^0.35.4",
     "simple-ytdl-core": "^1.1.1",
+    "yazl": "^3.3.1",
     "youtube-dl-exec": "^3.1.15",
     "youtubei.js": "^17.2.0"
   },
