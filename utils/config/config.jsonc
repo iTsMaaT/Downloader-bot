@@ -20,7 +20,7 @@
         { "type": 2, "name": "your freaky songs" },
         { "type": 3, "name": "your downloads finish" },
         { "type": 4, "name": "Over 10MB? Boost the server" },
-        { "type": 4, "name": "Playlists? One song at a time, please" },
+        { "type": 4, "name": "Playlists? Zipped and ready" },
         { "type": 4, "name": "Paste a link, get a file" },
         { "type": 4, "name": "Spotify link? I'll find it elsewhere" },
         { "type": 0, "name": "with FFmpeg" },
@@ -79,6 +79,19 @@
 
     // Log rate-limited events
     "logRateLimited": false,
+
+    "googleDrive": {
+        // Folder created in the user's Drive where /download saves files (when linked with /drive login)
+        "folderName": "Downloader Bot"
+    },
+
+    // Playlist/album downloads (sent as zip files)
+    "playlistDownload": {
+        "maxTracks": 100,           // Tracks past this are ignored
+        "maxDiscordZipParts": 10,   // Max zip files sent in Discord (Google Drive always gets a single zip)
+        "concurrency": 2,           // Tracks downloaded in parallel per playlist
+        "maxConcurrentJobs": 3      // Playlists downloading at the same time, across all users
+    },
 
     // Default Gemini model for AI interactions
     "defaultGeminiModel": "gemini-3-flash-preview",
