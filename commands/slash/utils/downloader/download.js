@@ -18,31 +18,52 @@ const {
     createSuccessEmbed,
     estimateFileSize,
 } = require("@root/utils/helpers/player/downloadHelpers");
+const googleDrive = require("@utils/helpers/googleDrive");
+const { handlePlaylistDownload } = require("@utils/helpers/player/playlistDownloadFlow");
+const userSettings = require("@utils/helpers/userSettings");
+const { FORMAT_CHOICES, QUALITY_CHOICES } = require("@utils/helpers/player/audioFormats");
 
 const DEFAULT_UPLOAD_LIMIT_MB = 10;
 const PROMPT_TIMEOUT_MS = 60_000;
 
 module.exports = {
     name: "download",
-    description: "Search and download a song.",
+    description: "Search and download a song, or a playlist as a zip.",
     type: ApplicationCommandType.ChatInput,
+    cooldown: 10_000,
     options: [
         {
             name: "query",
-            description: "Song name or URL",
+            description: "Song name, or a song/playlist/album URL",
             type: 3,
             required: true,
+        },
+        {
+            name: "format",
+            description: "Audio format (default: your /drive settings, or MP3)",
+            type: 3,
+            choices: FORMAT_CHOICES,
+        },
+        {
+            name: "quality",
+            description: "Audio quality (default: your /drive settings, or medium)",
+            type: 3,
+            choices: QUALITY_CHOICES,
         },
     ],
 
     async execute(logger, interaction, client) {
         const query = interaction.options.getString("query");
         const player = useMainPlayer();
+        const profile = userSettings.getAudioProfile(interaction.user.id, {
+            format: interaction.options.getString("format"),
+            quality: interaction.options.getString("quality"),
+        });
 
         try {
             // Raw text queries: let the user pick from every streamable source
             if (!isUrlQuery(query))
-                return await handleMultiSourceDownload(interaction, player, query);
+                return await handleMultiSourceDownload(interaction, player, query, profile);
 
             // Resolve the query
             const resolved = await awareQueryResolver(query, player);
@@ -65,22 +86,19 @@ module.exports = {
                 });
             }
 
-            const track = searchResult.tracks[0];
+            // Playlists/albums are zipped (bridged per track if the source can't stream)
+            if (searchResult.hasPlaylist())
+                return await handlePlaylistDownload(interaction, player, searchResult, getGuildUploadLimitMB(interaction), profile);
 
-            // Reject playlists
-            if (searchResult.hasPlaylist()) {
-                return await interaction.editReply({
-                    content: "❌ Playlists are not supported for download. Please provide a direct song link or search query.",
-                });
-            }
+            const track = searchResult.tracks[0];
 
             // If can stream directly, download it
             if (resolved.canStream)
-                return await handleDirectDownload(interaction, track);
+                return await handleDirectDownload(interaction, track, profile);
             
 
             // Otherwise, search across extractors and present options
-            return await handleMultiSourceDownload(interaction, player, `${track.title} ${track.author}`);
+            return await handleMultiSourceDownload(interaction, player, `${track.title} ${track.author}`, profile);
 
         } catch (error) {
             console.error("Download command error:", error);
@@ -94,14 +112,14 @@ module.exports = {
 /**
  * Handle direct download when track can be streamed
  */
-async function handleDirectDownload(interaction, track) {
-    return await performTrackDownload(interaction, track);
+async function handleDirectDownload(interaction, track, profile) {
+    return await performTrackDownload(interaction, track, profile);
 }
 
 /**
  * Handle multi-source download when track cannot be directly streamed
  */
-async function handleMultiSourceDownload(interaction, player, searchQuery) {
+async function handleMultiSourceDownload(interaction, player, searchQuery, profile) {
     try {
         // Search across all streamable extractors
         const searchResults = await searchAcrossExtractors(player, searchQuery);
@@ -173,7 +191,7 @@ async function handleMultiSourceDownload(interaction, player, searchQuery) {
                     await i.deferUpdate();
 
                     // Download the selected track (handles the size prompt + downloading view)
-                    await performTrackDownload(i, selectedTrack);
+                    await performTrackDownload(i, selectedTrack, profile);
                 }
             } catch (error) {
                 console.error("Collector interaction error:", error);
@@ -204,38 +222,59 @@ async function handleMultiSourceDownload(interaction, player, searchQuery) {
 
 /**
  * Performs the actual track download
+ * @param {import("@utils/helpers/player/audioFormats").AudioProfile} profile Output format
  */
-async function performTrackDownload(interaction, track) {
+async function performTrackDownload(interaction, track, profile) {
     try {
-        const sizeCheck = getEstimatedSizeCheck(interaction, track);
+        const sizeCheck = getEstimatedSizeCheck(interaction, track, profile);
         const uploadLimitMB = getGuildUploadLimitMB(interaction);
-        let compressApproved = false;
+        const driveLinked = googleDrive.isLinked(interaction.user.id);
+        const { destination: preferredDestination } = userSettings.getSettings(interaction.user.id);
+
+        // "discord": attach as-is, "compress": attach a compressed copy, "drive": save to the user's Google Drive
+        let destination = "discord";
 
         if (sizeCheck.tooBig) {
-            compressApproved = await promptCompressOrCancel(
+            const choice = await promptDestinationChoice(
                 interaction,
-                `This track is estimated at ~${sizeCheck.sizeMB.toFixed(2)}MB, which is above this server's upload limit (${uploadLimitMB}MB).`,
+                `⚠️ This track is estimated at ~${sizeCheck.sizeMB.toFixed(2)}MB, which is above this server's upload limit (${uploadLimitMB}MB).`,
+                { oversize: true, allowDrive: driveLinked },
             );
 
-            if (!compressApproved)
+            if (!choice)
                 return;
+            destination = choice;
+        } else if (driveLinked && preferredDestination !== "ask") {
+            destination = preferredDestination;
+        } else if (driveLinked) {
+            const choice = await promptDestinationChoice(
+                interaction,
+                `🎵 **${track.title}** · ${profile.label}${sizeCheck.sizeMB ? ` · ~${sizeCheck.sizeMB.toFixed(2)}MB` : ""}`,
+                { oversize: false, allowDrive: true },
+            );
+
+            if (!choice)
+                return;
+            destination = choice;
         }
 
         // Show downloading message
         let content = null;
-        if (compressApproved)
+        if (destination === "drive")
+            content = "☁️ The file will be saved to your Google Drive once downloaded.";
+        else if (destination === "compress")
             content = `🗜️ The file will be compressed to fit under ${uploadLimitMB}MB once downloaded.`;
         else if (sizeCheck.shouldWarn)
             content = `⚠️ Estimated size is ~${sizeCheck.sizeMB.toFixed(2)}MB. Discord may fail to send this file.`;
 
         await interaction.editReply({
             content,
-            embeds: [createDownloadingEmbed(track)],
+            embeds: [createDownloadingEmbed(track, profile)],
             components: [],
         });
 
         // Download the track
-        const outputPath = await downloadViaStream(track);
+        const outputPath = await downloadViaStream(track, profile);
 
         if (!outputPath) {
             return await interaction.editReply({
@@ -245,8 +284,15 @@ async function performTrackDownload(interaction, track) {
             });
         }
 
+        if (destination === "drive")
+            return await saveToDrive(interaction, track, outputPath, profile);
+
         // Send the downloaded file
-        await sendDownloadedFile(interaction, track, outputPath, compressApproved);
+        await sendDownloadedFile(interaction, track, outputPath, {
+            profile,
+            compressApproved: destination === "compress",
+            allowDrive: driveLinked,
+        });
 
     } catch (error) {
         console.error("Track download error:", error.message);
@@ -259,62 +305,129 @@ async function performTrackDownload(interaction, track) {
 }
 
 /**
- * Asks the user whether they want a compressed version of a file that's too big for Discord.
- * @returns {Promise<boolean>} true if the user chose to compress, false on cancel/timeout
+ * Asks the user where the file should go.
+ * - oversize: Save to Google Drive (if allowed), Get compressed version, Cancel
+ * - otherwise: Send here, Save to Google Drive (if allowed), Cancel
+ * @param {string} reason First line of the prompt
+ * @param {{ oversize?: boolean, allowDrive?: boolean }} [options]
+ * @returns {Promise<"discord" | "compress" | "drive" | null>} The chosen destination, null on cancel/timeout
  */
-async function promptCompressOrCancel(interaction, reason) {
-    const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId("size_compress")
-            .setLabel("Get compressed version")
-            .setEmoji("🗜️")
-            .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
-            .setCustomId("size_cancel")
-            .setLabel("Cancel")
-            .setStyle(ButtonStyle.Secondary),
-    );
+async function promptDestinationChoice(interaction, reason, { oversize = true, allowDrive = false } = {}) {
+    const choices = [];
+    if (!oversize)
+        choices.push({ id: "dest_discord", value: "discord", label: "Send here", emoji: "📎" });
+    if (allowDrive)
+        choices.push({ id: "dest_drive", value: "drive", label: "Save to Google Drive", emoji: "☁️" });
+    if (oversize)
+        choices.push({ id: "dest_compress", value: "compress", label: "Get compressed version", emoji: "🗜️" });
+
+    const buttons = choices.map((choice, index) => new ButtonBuilder()
+        .setCustomId(choice.id)
+        .setLabel(choice.label)
+        .setEmoji(choice.emoji)
+        .setStyle(index === 0 ? ButtonStyle.Primary : ButtonStyle.Secondary));
+    buttons.push(new ButtonBuilder()
+        .setCustomId("dest_cancel")
+        .setLabel("Cancel")
+        .setStyle(ButtonStyle.Secondary));
+
+    let question;
+    if (!oversize)
+        question = "Do you want the file sent here, or saved to your Google Drive?";
+    else if (allowDrive)
+        question = "Do you want to save it to your Google Drive (full quality), get a compressed (lower quality) version here, or cancel?";
+    else
+        question = "Do you want a compressed (lower quality) version that fits, or cancel?";
 
     const message = await interaction.editReply({
-        content: `⚠️ ${reason}\nDo you want a compressed (lower quality) version that fits, or cancel?`,
+        content: `${reason}\n${question}`,
         embeds: [],
         files: [],
-        components: [row],
+        components: [new ActionRowBuilder().addComponents(buttons)],
     });
 
+    const customIds = buttons.map((button) => button.data.custom_id);
     let choice;
     try {
         choice = await message.awaitMessageComponent({
-            filter: (i) => i.user.id === interaction.user.id && ["size_compress", "size_cancel"].includes(i.customId),
+            filter: (i) => i.user.id === interaction.user.id && customIds.includes(i.customId),
             componentType: ComponentType.Button,
             time: PROMPT_TIMEOUT_MS,
         });
     } catch {
         await interaction.editReply({ content: "⏱️ Download request timed out.", components: [] }).catch(() => { /**/ });
-        return false;
+        return null;
     }
 
-    if (choice.customId === "size_cancel") {
+    if (choice.customId === "dest_cancel") {
         await choice.update({ content: "❌ Download cancelled.", components: [] });
-        return false;
+        return null;
     }
 
     await choice.deferUpdate();
-    return true;
+    return choices.find((c) => c.id === choice.customId).value;
+}
+
+/**
+ * Uploads the downloaded file to the user's Google Drive.
+ * Falls back to sending it in Discord if the upload fails.
+ */
+async function saveToDrive(interaction, track, outputPath, profile) {
+    await interaction.editReply({
+        content: "☁️ Uploading to your Google Drive...",
+        embeds: [createDownloadingEmbed(track, profile)],
+        files: [],
+        components: [],
+    });
+
+    let file;
+    try {
+        const extension = path.extname(outputPath);
+        const name = track.author ? `${track.author} - ${track.title}${extension}` : path.basename(outputPath);
+        file = await googleDrive.uploadFile(interaction.user.id, outputPath, { name });
+    } catch (error) {
+        console.error(`Google Drive upload failed: ${error.message}`);
+
+        const relinkHint = error instanceof googleDrive.DriveAuthError
+            ? "\nYour Google Drive has been unlinked, use `/drive login` to link it again."
+            : "";
+        await interaction.followUp({
+            content: `⚠️ Couldn't save to your Google Drive: ${error.message}${relinkHint}\nSending the file in Discord instead.`,
+            flags: MessageFlags.Ephemeral,
+        }).catch(() => { /**/ });
+
+        // Drive is what just failed, so don't offer it again
+        return await sendDownloadedFile(interaction, track, outputPath, { profile, allowDrive: false });
+    }
+
+    const sizeMB = Number(file.size) / (1024 * 1024) || getOutputFileSizeCheck(outputPath, Infinity).sizeMB || undefined;
+    const embed = createSuccessEmbed(track, { sizeMB, profile }).setTitle("✅ Saved to Google Drive");
+
+    const links = [];
+    if (file.webViewLink)
+        links.push(new ButtonBuilder().setLabel("Open file").setStyle(ButtonStyle.Link).setURL(file.webViewLink));
+    if (file.folderLink)
+        links.push(new ButtonBuilder().setLabel(`Open ${googleDrive.getFolderName()}`).setStyle(ButtonStyle.Link).setURL(file.folderLink));
+
+    await interaction.editReply({
+        content: null,
+        embeds: [embed],
+        components: links.length ? [new ActionRowBuilder().addComponents(links)] : [],
+    });
 }
 
 /**
  * Compresses the downloaded file to fit the upload limit and sends it.
  */
-async function sendCompressedFile(interaction, track, outputPath, uploadLimitMB) {
+async function sendCompressedFile(interaction, track, outputPath, uploadLimitMB, profile) {
     await interaction.editReply({
         content: `🗜️ Compressing to fit under ${uploadLimitMB}MB...`,
-        embeds: [createDownloadingEmbed(track)],
+        embeds: [createDownloadingEmbed(track, profile)],
         files: [],
         components: [],
     });
 
-    const result = await compressAudioFile(outputPath, uploadLimitMB, track.durationMS);
+    const result = await compressAudioFile(outputPath, uploadLimitMB, track.durationMS, profile.estimateKbps);
 
     if (!result) {
         return await interaction.editReply({
@@ -328,7 +441,8 @@ async function sendCompressedFile(interaction, track, outputPath, uploadLimitMB)
         await interaction.editReply({
             content: null,
             embeds: [createSuccessEmbed(track, { sizeMB: result.sizeMB, bitrateKbps: result.bitrateKbps, compressed: true })],
-            files: [{ attachment: result.path, name: path.basename(outputPath) }],
+            // Compressed copies are always MP3, whatever the original format
+            files: [{ attachment: result.path, name: `${path.parse(outputPath).name}.mp3` }],
             components: [],
         });
     } catch (error) {
@@ -352,11 +466,11 @@ function isUrlQuery(query) {
     }
 }
 
-function getEstimatedSizeCheck(interaction, track) {
+function getEstimatedSizeCheck(interaction, track, profile) {
     if (!track?.durationMS || Number.isNaN(track.durationMS))
         return { sizeMB: null, shouldWarn: false, tooBig: false };
 
-    const sizeMB = estimateFileSize(track.durationMS);
+    const sizeMB = estimateFileSize(track.durationMS, profile.estimateKbps);
     const uploadLimitMB = getGuildUploadLimitMB(interaction);
     const warningThresholdMB = Math.max(1, uploadLimitMB - 0.5);
 
@@ -385,28 +499,34 @@ function getOutputFileSizeCheck(filePath, uploadLimitMB) {
 }
 
 /**
- * Sends the downloaded file, offering a compressed version if it's too big.
- * @param {boolean} compressApproved The user already chose to compress (skip asking again)
+ * Sends the downloaded file. If it turns out too big, asks again (compressed version, or Google Drive if allowed).
+ * @param {{ profile: import("@utils/helpers/player/audioFormats").AudioProfile, compressApproved?: boolean, allowDrive?: boolean }} options
+ *   profile: format of the file
+ *   compressApproved: the user already chose to compress (skip asking again)
+ *   allowDrive: offer Google Drive if the file is too big (user has it linked)
  */
-async function sendDownloadedFile(interaction, track, outputPath, compressApproved = false) {
+async function sendDownloadedFile(interaction, track, outputPath, { profile, compressApproved = false, allowDrive = false }) {
     const uploadLimitMB = getGuildUploadLimitMB(interaction);
     const outputSizeCheck = getOutputFileSizeCheck(outputPath, uploadLimitMB);
 
     if (outputSizeCheck.tooBig) {
-        const approved = compressApproved || await promptCompressOrCancel(
+        const choice = compressApproved ? "compress" : await promptDestinationChoice(
             interaction,
-            `Downloaded file is ${outputSizeCheck.sizeMB.toFixed(2)}MB, which is above this server's upload limit (${uploadLimitMB}MB).`,
+            `⚠️ Downloaded file is ${outputSizeCheck.sizeMB.toFixed(2)}MB, which is above this server's upload limit (${uploadLimitMB}MB).`,
+            { oversize: true, allowDrive },
         );
 
-        if (approved)
-            await sendCompressedFile(interaction, track, outputPath, uploadLimitMB);
+        if (choice === "drive")
+            await saveToDrive(interaction, track, outputPath, profile);
+        else if (choice === "compress")
+            await sendCompressedFile(interaction, track, outputPath, uploadLimitMB, profile);
         return;
     }
 
     try {
         await interaction.editReply({
             content: null,
-            embeds: [createSuccessEmbed(track, { sizeMB: outputSizeCheck.sizeMB || undefined })],
+            embeds: [createSuccessEmbed(track, { sizeMB: outputSizeCheck.sizeMB || undefined, profile })],
             files: [outputPath],
             components: [],
         });
@@ -415,15 +535,18 @@ async function sendDownloadedFile(interaction, track, outputPath, compressApprov
             throw error;
 
         // Real limit can be lower than what we computed (e.g. DMs / user-installed app context)
-        const approved = compressApproved || await promptCompressOrCancel(
+        const choice = compressApproved ? "compress" : await promptDestinationChoice(
             interaction,
-            "Discord rejected this upload because the file is too large for this server/context.",
+            "⚠️ Discord rejected this upload because the file is too large for this server/context.",
+            { oversize: true, allowDrive },
         );
 
-        if (approved) {
+        if (choice === "drive") {
+            await saveToDrive(interaction, track, outputPath, profile);
+        } else if (choice === "compress") {
             // The actual limit is unknown here, so aim for Discord's base limit (and below the current size)
             const fallbackLimitMB = Math.min(DEFAULT_UPLOAD_LIMIT_MB, outputSizeCheck.sizeMB * 0.9 || DEFAULT_UPLOAD_LIMIT_MB);
-            await sendCompressedFile(interaction, track, outputPath, fallbackLimitMB);
+            await sendCompressedFile(interaction, track, outputPath, fallbackLimitMB, profile);
         }
     }
 }

@@ -1,5 +1,5 @@
 const { Constants, YTNodes } = require("youtubei.js");
-const { EnabledTrackTypes, buildSabrFormat } = require("googlevideo/utils");
+const { EnabledTrackTypes, buildSabrFormat, Logger, LogLevel } = require("googlevideo/utils");
 const { SabrStream } = require("googlevideo/sabr-stream");
 const { getWebPoMinter, invalidateWebPoMinter, generateDataSyncTokens } = require("./poTokenGenerator.js");
 const { getInnertube } = require("./getInnertube.js");
@@ -8,7 +8,28 @@ const { toNodeReadable } = require("./youtubeSharedUtils.js");
 const DEFAULT_OPTIONS = {
     audioQuality: "AUDIO_QUALITY_MEDIUM",
     enabledTrackTypes: EnabledTrackTypes.AUDIO_ONLY,
+    // The default (10) waits ~55s with backoff before giving up, mostly on a request past the end of the track
+    maxRetries: 3,
 };
+
+// How much audio can be missing at the end for a failed stream to still count as complete
+const COMPLETE_TOLERANCE_MS = 1500;
+
+/**
+ * Sums the duration of the segments downloaded for a format and reads its expected duration.
+ * @param {{ formatInitializationMetadata: any, downloadedSegments: Map<any, { durationMs?: string }> }} format
+ * @returns {{ downloadedMs: number, expectedMs: number }}
+ */
+function getFormatProgress(format) {
+    const meta = format.formatInitializationMetadata ?? {};
+    const units = parseInt(meta.durationUnits || "0");
+    const timescale = parseInt(meta.durationTimescale || "0");
+    const expectedMs = timescale ? Math.trunc(units / (timescale / 1000)) : 0;
+    let downloadedMs = 0;
+    for (const segment of format.downloadedSegments.values())
+        downloadedMs += parseInt(segment.durationMs || "0");
+    return { downloadedMs, expectedMs };
+}
 
 
 /**
@@ -18,6 +39,9 @@ const DEFAULT_OPTIONS = {
  * @returns {Promise<Readable>} The SABR stream
  */
 async function createSabrStream(videoId, cookies, logSabrEvents = false) {
+    // googlevideo logs every retry and the final failure itself; failures that matter are logged below instead
+    Logger.getInstance().setLogLevels(logSabrEvents ? LogLevel.ALL : LogLevel.NONE);
+
     const innertube = await getInnertube(cookies);
     let accountInfo;
 
@@ -73,6 +97,16 @@ async function createSabrStream(videoId, cookies, logSabrEvents = false) {
         },
     });
 
+    // SabrStream clears its format state before reporting an error, so keep our own references
+    const audioFormats = [];
+    serverAbrStream.on("formatInitialization", (format) => {
+        if (format.formatInitializationMetadata?.mimeType?.includes("audio")) audioFormats.push(format);
+    });
+    const isComplete = () => audioFormats.some((format) => {
+        const { downloadedMs, expectedMs } = getFormatProgress(format);
+        return expectedMs > 0 && downloadedMs >= expectedMs - COMPLETE_TOLERANCE_MS;
+    });
+
     // === Stream protection handling ===
     let protectionFailureCount = 0;
     let lastStatus = null;
@@ -105,13 +139,18 @@ async function createSabrStream(videoId, cookies, logSabrEvents = false) {
         }
     });
 
-    serverAbrStream.on("error", (err) => {
-        if (logSabrEvents) console.error("SABR stream error:", err);
-    });
-
     // === Start SABR stream ===
     const { audioStream } = await serverAbrStream.start(DEFAULT_OPTIONS);
-    const nodeStream = toNodeReadable(audioStream);
+    const nodeStream = toNodeReadable(audioStream, {
+        isComplete,
+        onIgnoredError: (err) => {
+            if (logSabrEvents) console.log(`[SABR] ${videoId}: ignored error after the full track was received (${err.message})`);
+        },
+    });
+    nodeStream.on("error", (err) => {
+        const progress = audioFormats.map(getFormatProgress).map(p => `${p.downloadedMs}/${p.expectedMs}ms`).join(", ") || "no audio received";
+        console.error(`[SABR] ${videoId}: stream failed before the end (${progress}): ${err.message}`);
+    });
 
     return nodeStream;
 }

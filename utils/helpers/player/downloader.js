@@ -5,11 +5,11 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
-const crypto = require("node:crypto");
 const https = require("node:https");
 const { PassThrough } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
 const { StreamType } = require("discord-player");
+const { resolveProfile } = require("@utils/helpers/player/audioFormats");
 
 const DOWNLOAD_ROOT = path.resolve("./downloads");
 const MAX_CONCURRENT = 2;
@@ -22,8 +22,12 @@ const activeJobs = new Set();
 /** @type {Array<() => Promise<void>>} */
 const queue = [];
 
-/** @type {Set<string>} */
-const knownHashes = new Set();
+/**
+ * Downloads currently writing to a path. Two requests for the same file (same track, same format)
+ * share one download instead of writing the same file at the same time.
+ * @type {Map<string, Promise<string | null>>}
+ */
+const inFlightDownloads = new Map();
 
 /**
  * Ensures a directory exists (recursive).
@@ -45,15 +49,16 @@ function waitForFfmpegClose(ffmpeg) {
 }
 
 /**
- * Builds ffmpeg metadata args for audio output.
+ * Builds ffmpeg encoder + metadata args for audio output.
  * @param {{ title: string, artist: string, album: string, year: string | null }} params
+ * @param {import("@utils/helpers/player/audioFormats").AudioProfile} profile
  * @returns {string[]}
  */
-function buildAudioMetadataArgs({ title, artist, album, year }) {
+function buildAudioMetadataArgs({ title, artist, album, year }, profile) {
     const args = [
-        "-ar", "44100",
+        ...(profile.sampleRate ? ["-ar", String(profile.sampleRate)] : []),
         "-ac", "2",
-        "-b:a", "192k",
+        ...profile.encoderArgs,
         "-metadata", `title=${title}`,
         "-metadata", `artist=${artist}`,
         "-metadata", `album=${album}`,
@@ -67,11 +72,12 @@ function buildAudioMetadataArgs({ title, artist, album, year }) {
 
 /**
  * Builds optional cover art args.
- * @param {Buffer | null} thumbBuffer
+ * @param {Buffer | null} thumbBuffer Only pass one when the profile supports cover art
+ * @param {import("@utils/helpers/player/audioFormats").AudioProfile} profile
  * @returns {string[]}
  */
-function buildCoverArgs(thumbBuffer) {
-    if (!thumbBuffer)
+function buildCoverArgs(thumbBuffer, profile) {
+    if (!thumbBuffer || !profile.coverArgs)
         return ["-vn"];
 
     return [
@@ -79,10 +85,7 @@ function buildCoverArgs(thumbBuffer) {
         "-i", "pipe:3",
         "-map", "0:a",
         "-map", "1:v",
-        "-c:v", "mjpeg",
-        "-id3v2_version", "3",
-        "-metadata:s:v", "title=Album cover",
-        "-metadata:s:v", "comment=Cover (front)",
+        ...profile.coverArgs,
     ];
 }
 
@@ -93,9 +96,10 @@ function buildCoverArgs(thumbBuffer) {
  * @param {{ title: string, artist: string, album: string, year: string | null }} tags
  * @param {Buffer | null} thumbBuffer
  * @param {string} outputPath
+ * @param {import("@utils/helpers/player/audioFormats").AudioProfile} profile
  * @returns {Promise<number>}
  */
-async function transcodeStreamAttempt(stream, inputArgs, tags, thumbBuffer, outputPath) {
+async function transcodeStreamAttempt(stream, inputArgs, tags, thumbBuffer, outputPath, profile) {
     const args = [
         "-loglevel", "error",
         "-fflags", "+discardcorrupt",
@@ -104,9 +108,9 @@ async function transcodeStreamAttempt(stream, inputArgs, tags, thumbBuffer, outp
         "-analyzeduration", "10M",
         ...inputArgs,
         "-i", "pipe:0",
-        ...buildCoverArgs(thumbBuffer),
-        ...buildAudioMetadataArgs(tags),
-        "-f", "mp3",
+        ...buildCoverArgs(thumbBuffer, profile),
+        ...buildAudioMetadataArgs(tags, profile),
+        "-f", profile.muxer,
         outputPath,
     ];
 
@@ -115,10 +119,12 @@ async function transcodeStreamAttempt(stream, inputArgs, tags, thumbBuffer, outp
     });
 
     ffmpeg.stdin.on("error", () => {});
-    // pipe() doesn't close the destination on source error, which would leave ffmpeg waiting forever
+    // pipe() doesn't close the destination on source error, which would leave ffmpeg waiting forever.
+    // Kill ffmpeg instead of ending its input, so a cut-off stream fails the attempt instead of saving a partial file.
     stream.on("error", (err) => {
         console.error("[Download] Source stream error:", err.message);
-        if (!ffmpeg.stdin.destroyed) ffmpeg.stdin.end();
+        if (!ffmpeg.stdin.destroyed) ffmpeg.stdin.destroy();
+        ffmpeg.kill("SIGKILL");
     });
     stream.pipe(ffmpeg.stdin);
 
@@ -137,14 +143,20 @@ async function transcodeStreamAttempt(stream, inputArgs, tags, thumbBuffer, outp
  * @param {{ title: string, artist: string, album: string, year: string | null }} tags
  * @param {Buffer | null} thumbBuffer
  * @param {string} outputPath
+ * @param {import("@utils/helpers/player/audioFormats").AudioProfile} profile
  * @returns {Promise<number>}
  */
-async function transcodeViaBufferedInput(stream, tags, thumbBuffer, outputPath) {
+async function transcodeViaBufferedInput(stream, tags, thumbBuffer, outputPath, profile) {
     const tempInputPath = `${outputPath}.input.tmp`;
 
     try {
         const tempWriteStream = fs.createWriteStream(tempInputPath);
-        await pipeline(stream, tempWriteStream);
+        try {
+            await pipeline(stream, tempWriteStream);
+        } catch (err) {
+            console.error("[Download] Source stream error (buffered):", err.message);
+            return 1;
+        }
 
         const args = [
             "-loglevel", "error",
@@ -153,9 +165,9 @@ async function transcodeViaBufferedInput(stream, tags, thumbBuffer, outputPath) 
             "-probesize", "10M",
             "-analyzeduration", "10M",
             "-i", tempInputPath,
-            ...buildCoverArgs(thumbBuffer),
-            ...buildAudioMetadataArgs(tags),
-            "-f", "mp3",
+            ...buildCoverArgs(thumbBuffer, profile),
+            ...buildAudioMetadataArgs(tags, profile),
+            "-f", profile.muxer,
             outputPath,
         ];
 
@@ -349,9 +361,12 @@ function downloadTrack(track, fallbackData) {
 
 /**
  * Downloads a track using track.stream().
+ * Files are cached until the daily cleanup: the same track in the same format is only downloaded once.
  * @param {import("discord-player").Track} track
+ * @param {import("@utils/helpers/player/audioFormats").AudioProfile} [profile] Output format, MP3 192 kbps by default
+ * @returns {Promise<string | null>} The output path, null if the download failed
  */
-async function downloadViaStream(track) {
+async function downloadViaStream(track, profile = resolveProfile()) {
     activeDownloadOperations++;
     try {
         const isDeezerTrack = track?.extractor?.identifier === "com.retrouser955.discord-player.deezr-ext";
@@ -368,133 +383,135 @@ async function downloadViaStream(track) {
 
         album = sanitize(album || "Unknown Album");
 
-        const outputDir = path.join(DOWNLOAD_ROOT, artist, album);
+        // The default format keeps the original layout (shared with the player's auto-download)
+        const formatRoot = profile.isDefault ? DOWNLOAD_ROOT : path.join(DOWNLOAD_ROOT, "_formats", profile.key);
+        const outputDir = path.join(formatRoot, artist, album);
         ensureDir(outputDir);
 
-        const outputPath = path.join(outputDir, `${title}.mp3`);
+        const outputPath = path.join(outputDir, `${title}${profile.extension}`);
+
+        if (inFlightDownloads.has(outputPath)) {
+            console.log(`[JOIN IN-FLIGHT] ${outputPath}`);
+            return await inFlightDownloads.get(outputPath);
+        }
 
         if (fs.existsSync(outputPath)) {
             console.log(`[SKIP EXISTS] ${outputPath}`);
             return outputPath;
         }
 
-        console.log(`[STREAM DOWNLOAD] ${artist} - ${title}`);
-
-        const hash = crypto.createHash("sha1");
-        let hashing = true;
-
-        let thumbBuffer = await fetchThumbnail(
-            track.thumbnail || track.raw?.thumbnails?.[0]?.url,
-        );
-
-        // ---- Detect WebP ----
-        const isWebp =
-        thumbBuffer &&
-        thumbBuffer.subarray(0, 4).toString() === "RIFF" &&
-        thumbBuffer.subarray(8, 12).toString() === "WEBP";
-
-        if (isWebp) {
-            console.log("[THUMBNAIL] WebP detected → converting to JPEG");
-
-            const converted = await convertToJpeg(thumbBuffer);
-
-            if (converted && converted.length > 0) {
-                thumbBuffer = converted;
-            } else {
-                console.log("[THUMBNAIL] Conversion failed → skipping");
-                thumbBuffer = null;
-            }
+        const download = transcodeTrack(track, profile, { title, artist, album, year, isDeezerTrack }, outputPath);
+        inFlightDownloads.set(outputPath, download);
+        try {
+            return await download;
+        } finally {
+            inFlightDownloads.delete(outputPath);
         }
-        const tags = { title, artist, album, year };
-        const inputCandidates = [
-            [],
-            ...(isDeezerTrack ? [["-f", "mp3"]] : []),
-            ["-f", "opus"],
-            ["-f", "s16le", "-ar", "48000", "-ac", "2"],
-        ];
+    } finally {
+        activeDownloadOperations = Math.max(0, activeDownloadOperations - 1);
+    }
+}
 
-        let success = false;
+/**
+ * Streams a track and encodes it to outputPath, trying several input modes.
+ * @returns {Promise<string | null>}
+ */
+async function transcodeTrack(track, profile, { title, artist, album, year, isDeezerTrack }, outputPath) {
+    console.log(`[STREAM DOWNLOAD] ${artist} - ${title} (${profile.label})`);
 
-        for (const inputArgs of inputCandidates) {
-            let stream;
+    let thumbBuffer = profile.coverArgs
+        ? await fetchThumbnail(track.thumbnail || track.raw?.thumbnails?.[0]?.url)
+        : null;
+
+    // ---- Detect WebP ----
+    const isWebp =
+    thumbBuffer &&
+    thumbBuffer.subarray(0, 4).toString() === "RIFF" &&
+    thumbBuffer.subarray(8, 12).toString() === "WEBP";
+
+    if (isWebp) {
+        console.log("[THUMBNAIL] WebP detected → converting to JPEG");
+
+        const converted = await convertToJpeg(thumbBuffer);
+
+        if (converted && converted.length > 0) {
+            thumbBuffer = converted;
+        } else {
+            console.log("[THUMBNAIL] Conversion failed → skipping");
+            thumbBuffer = null;
+        }
+    }
+    const tags = { title, artist, album, year };
+    const inputCandidates = [
+        [],
+        ...(isDeezerTrack ? [["-f", "mp3"]] : []),
+        ["-f", "opus"],
+        ["-f", "s16le", "-ar", "48000", "-ac", "2"],
+    ];
+
+    let success = false;
+
+    for (const inputArgs of inputCandidates) {
+        let stream;
+        try {
+            stream = await Promise.race([
+                track.extractor.stream(track),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("Stream timeout")), 10000)),
+            ]);
+        } catch (e) {
+            throw e;
+        }
+
+        if (!stream || typeof stream.pipe !== "function")
+            throw new Error("Extractor did not return a pipeable stream");
+
+        const code = await transcodeStreamAttempt(stream, inputArgs, tags, thumbBuffer, outputPath, profile);
+
+        if (code === 0) {
+            success = true;
+            break;
+        }
+
+        fs.rmSync(outputPath, { force: true });
+
+        if (!inputArgs.length) {
+            let retryStream;
             try {
-                stream = await Promise.race([
+                retryStream = await Promise.race([
                     track.extractor.stream(track),
                     new Promise((_, reject) => setTimeout(() => reject(new Error("Stream timeout")), 10000)),
                 ]);
-            } catch (e) {
-                throw e;
+            } catch {
+                continue;
             }
 
-            if (!stream || typeof stream.pipe !== "function")
-                throw new Error("Extractor did not return a pipeable stream");
+            const bufferedCode = await transcodeViaBufferedInput(retryStream, tags, thumbBuffer, outputPath, profile);
 
-            stream.on("data", (c) => {
-                if (hashing) hash.update(c);
-            });
-
-            const code = await transcodeStreamAttempt(stream, inputArgs, tags, thumbBuffer, outputPath);
-
-            if (code === 0) {
+            if (bufferedCode === 0) {
                 success = true;
                 break;
             }
 
             fs.rmSync(outputPath, { force: true });
-
-            if (!inputArgs.length) {
-                let retryStream;
-                try {
-                    retryStream = await Promise.race([
-                        track.extractor.stream(track),
-                        new Promise((_, reject) => setTimeout(() => reject(new Error("Stream timeout")), 10000)),
-                    ]);
-                } catch {
-                    continue;
-                }
-
-                const bufferedCode = await transcodeViaBufferedInput(retryStream, tags, thumbBuffer, outputPath);
-
-                if (bufferedCode === 0) {
-                    success = true;
-                    break;
-                }
-
-                fs.rmSync(outputPath, { force: true });
-            }
         }
-
-        if (!success) {
-            console.log(`[FFMPEG ERROR] ${title} (all input modes failed)`);
-            fs.rmSync(outputPath, { force: true });
-            return null;
-        }
-        hashing = false;
-
-        const digest = hash.digest("hex");
-
-        if (!fs.existsSync(outputPath)) return null;
-
-        const stats = fs.statSync(outputPath);
-
-        if (stats.size < 100_000) {
-            fs.rmSync(outputPath, { force: true });
-            return null;
-        }
-
-        if (knownHashes.has(digest)) {
-            console.log(`[DUPLICATE] ${title}`);
-            fs.rmSync(outputPath, { force: true });
-            return null;
-        }
-
-        knownHashes.add(digest);
-
-        console.log(`[DONE] ${outputPath}`);
-        return outputPath;
-    } finally {
-        activeDownloadOperations = Math.max(0, activeDownloadOperations - 1);
     }
+
+    if (!success) {
+        console.log(`[FFMPEG ERROR] ${title} (all input modes failed)`);
+        fs.rmSync(outputPath, { force: true });
+        return null;
+    }
+    if (!fs.existsSync(outputPath)) return null;
+
+    const stats = fs.statSync(outputPath);
+
+    if (stats.size < 100_000) {
+        fs.rmSync(outputPath, { force: true });
+        return null;
+    }
+
+    console.log(`[DONE] ${outputPath}`);
+    return outputPath;
 }
 
 /**
@@ -530,13 +547,7 @@ async function downloadViaRaw(queueCtx, track, format, stream) {
         console.log(`[RAW FALLBACK] ${artist} - ${title}`);
 
         const passthrough = new PassThrough();
-        const hashStream = new PassThrough();
-
         stream.interceptors.add(passthrough);
-        stream.interceptors.add(hashStream);
-
-        const hash = crypto.createHash("sha1");
-        hashStream.on("data", (c) => hash.update(c));
 
         let aborted = false;
         stream.on("close", () => (aborted = true));
@@ -644,15 +655,6 @@ async function downloadViaRaw(queueCtx, track, format, stream) {
             return;
         }
 
-        const digest = hash.digest("hex");
-
-        if (knownHashes.has(digest)) {
-            fs.rmSync(outputPath, { force: true });
-            return;
-        }
-
-        knownHashes.add(digest);
-
         console.log(`[DONE RAW] ${outputPath}`);
     } finally {
         activeDownloadOperations = Math.max(0, activeDownloadOperations - 1);
@@ -719,13 +721,14 @@ function reencodeMp3(inputPath, outputPath, { kbps, ar }, keepCover) {
 }
 
 /**
- * Creates a compressed copy of an MP3 that fits under the given size.
+ * Creates a compressed MP3 copy of an audio file (any format) that fits under the given size.
  * @param {string} inputPath
  * @param {number} maxSizeMB
  * @param {number} [durationMS] Track duration, used to pick the bitrate. Estimated from file size if missing.
+ * @param {number} [sourceKbps] Average bitrate of the input, used to estimate how much of it is cover art/tags
  * @returns {Promise<{ path: string, bitrateKbps: number, sizeMB: number } | null>} null if it can't fit
  */
-async function compressAudioFile(inputPath, maxSizeMB, durationMS) {
+async function compressAudioFile(inputPath, maxSizeMB, durationMS, sourceKbps = ORIGINAL_BITRATE_KBPS) {
     activeDownloadOperations++;
     try {
         const inputSize = fs.statSync(inputPath).size;
@@ -734,13 +737,13 @@ async function compressAudioFile(inputPath, maxSizeMB, durationMS) {
 
         const durationSec = durationMS > 0
             ? durationMS / 1000
-            : (inputSize * 8) / (ORIGINAL_BITRATE_KBPS * 1000);
+            : (inputSize * 8) / (sourceKbps * 1000);
 
         const kbpsForBudget = (bytes) => (bytes * 8) / durationSec / 1000;
         const lowestKbps = MP3_BITRATE_STEPS[MP3_BITRATE_STEPS.length - 1].kbps;
 
         // Whatever isn't audio (mostly cover art + tags) still has to fit in the budget
-        const overheadBytes = Math.max(0, inputSize - (ORIGINAL_BITRATE_KBPS * 1000 / 8) * durationSec);
+        const overheadBytes = Math.max(0, inputSize - (sourceKbps * 1000 / 8) * durationSec);
         let keepCover = true;
         let targetKbps = kbpsForBudget(targetBytes - overheadBytes);
 

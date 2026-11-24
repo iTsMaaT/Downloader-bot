@@ -5,10 +5,15 @@ const http = require("http");
 /**
  * Converts a web stream to a Node.js Readable stream
  * 
+ * Source errors are passed on (the Node stream is destroyed with the error) so a cut-off
+ * stream isn't mistaken for a finished one. If `isComplete()` returns true when the error
+ * happens, all the data already arrived and the stream ends normally instead.
+ *
  * @param {ReadableStream} stream - The web stream to convert
+ * @param {{ isComplete?: () => boolean, onIgnoredError?: (err: Error) => void }} [options]
  * @returns {Readable} The Node.js Readable stream
  */
-function toNodeReadable(stream) {
+function toNodeReadable(stream, { isComplete, onIgnoredError } = {}) {
     const nodeStream = new PassThrough();
     const reader = stream.getReader();
 
@@ -18,12 +23,19 @@ function toNodeReadable(stream) {
                 const { done, value } = await reader.read();
                 if (done) break;
                 if (value) {
-                    if (!nodeStream.write(Buffer.from(value))) 
+                    if (!nodeStream.write(Buffer.from(value)))
                         await once(nodeStream, "drain");
                 }
             }
-        } finally {
             nodeStream.end();
+        } catch (err) {
+            if (nodeStream.destroyed) return;
+            if (isComplete?.()) {
+                onIgnoredError?.(err);
+                nodeStream.end();
+            } else {
+                nodeStream.destroy(err);
+            }
         }
     })();
 

@@ -106,6 +106,7 @@ function formatDuration(ms) {
 }
 
 function estimateFileSize(durationMs, bitrate = 192) {
+    bitrate ||= 192;
     const bytes = (bitrate * 1000 / 8) * (durationMs / 1000);
     return bytes / (1024 * 1024);
 }
@@ -150,9 +151,13 @@ function getThumbnailURL(track) {
     return null;
 }
 
-function createDownloadingEmbed(track) {
+/**
+ * @param {import("discord-player").Track} track
+ * @param {import("@utils/helpers/player/audioFormats").AudioProfile} [profile] Output format, MP3 192 kbps if missing
+ */
+function createDownloadingEmbed(track, profile) {
     const duration = track.durationMS ? formatDuration(track.durationMS) : "Unknown";
-    const estimatedSize = track.durationMS ? estimateFileSize(track.durationMS) : null;
+    const estimatedSize = track.durationMS ? estimateFileSize(track.durationMS, profile?.estimateKbps) : null;
     const estimatedSizeStr = estimatedSize ? estimatedSize.toFixed(2) : "Unknown";
     const downloadTimeSeconds = estimatedSize ? estimateDownloadTime(estimatedSize) : null;
     const downloadTimeStr = downloadTimeSeconds ? formatTimeEstimate(downloadTimeSeconds) : "Unknown";
@@ -166,7 +171,7 @@ function createDownloadingEmbed(track) {
             { name: "Duration", value: duration, inline: true },
             { name: "Source", value: track.source || "Unknown", inline: true },
             { name: "Est. File Size", value: `${estimatedSizeStr}MB`, inline: true },
-            { name: "Quality", value: "192 kbps", inline: true },
+            { name: "Quality", value: profile?.label ?? "MP3 · 192 kbps", inline: true },
             { name: "Est. Time", value: downloadTimeStr, inline: true },
         );
 
@@ -179,14 +184,17 @@ function createDownloadingEmbed(track) {
 
 /**
  * @param {import("discord-player").Track} track
- * @param {{ sizeMB?: number, bitrateKbps?: number, compressed?: boolean }} [fileInfo] Actual file info, when known
+ * @param {{ sizeMB?: number, bitrateKbps?: number, compressed?: boolean, profile?: import("@utils/helpers/player/audioFormats").AudioProfile }} [fileInfo]
+ *   Actual file info, when known. Compressed files are always MP3 at bitrateKbps.
  */
 function createSuccessEmbed(track, fileInfo = {}) {
     const duration = track.durationMS ? formatDuration(track.durationMS) : "Unknown";
     const sizeStr = typeof fileInfo.sizeMB === "number"
         ? `${fileInfo.sizeMB.toFixed(2)}MB`
-        : `~${track.durationMS ? estimateFileSize(track.durationMS).toFixed(2) : "Unknown"}MB`;
-    const qualityStr = `${fileInfo.bitrateKbps ?? 192} kbps${fileInfo.compressed ? " (compressed)" : ""}`;
+        : `~${track.durationMS ? estimateFileSize(track.durationMS, fileInfo.profile?.estimateKbps).toFixed(2) : "Unknown"}MB`;
+    const qualityStr = fileInfo.compressed
+        ? `MP3 · ${fileInfo.bitrateKbps} kbps (compressed)`
+        : fileInfo.profile?.label ?? `MP3 · ${fileInfo.bitrateKbps ?? 192} kbps`;
 
     const embed = new EmbedBuilder()
         .setColor("#00AA00")
@@ -624,19 +632,56 @@ function downloadFromURL(url, outputPath, onProgress) {
     });
 }
 
-async function searchAcrossExtractors(player, query) {
+/**
+ * Supported extractors that can stream, in config.jsonc priority order
+ * (highest first; ties keep the order they're listed in the config)
+ */
+function getStreamableExtractors(player) {
     const extractors = player.extractors.store;
-    const results = new Map();
+    if (!extractors || !extractors.size) return [];
 
-    if (!extractors || !extractors.size) return results;
-
-    // Only search in supported extractors that can stream, in config.jsonc priority order
-    // (highest first; ties keep the order they're listed in the config)
-    const streamable = Array.from(extractors.values())
+    return Array.from(extractors.values())
         .filter((extractor) => EXTRACTOR_CAPABILITIES[extractor.identifier]?.canStream)
         .map((extractor) => ({ extractor, ...getConfiguredPriority(extractor) }))
         .sort((a, b) => b.priority - a.priority || a.order - b.order)
         .map(({ extractor }) => extractor);
+}
+
+/**
+ * Whether a track can be downloaded directly from its own extractor (no bridging needed).
+ */
+function isStreamableTrack(track) {
+    return Boolean(EXTRACTOR_CAPABILITIES[track?.extractor?.identifier]?.canStream);
+}
+
+/**
+ * Finds the first streamable match for a query, trying sources one by one in priority order.
+ * Used to bridge tracks automatically (e.g. Spotify playlist tracks) where there's no user to pick.
+ * @returns {Promise<import("discord-player").Track | null>}
+ */
+async function findStreamableMatch(player, query) {
+    for (const extractor of getStreamableExtractors(player)) {
+        try {
+            const searchResult = await player.search(query, {
+                searchEngine: `ext:${extractor.identifier}`,
+            });
+
+            const match = searchResult.tracks.find((t) => !t.isPlaylist);
+            if (match)
+                return match;
+        } catch (error) {
+            console.error(`Error searching with extractor ${extractor.identifier}:`, error.message);
+        }
+    }
+
+    return null;
+}
+
+async function searchAcrossExtractors(player, query) {
+    const results = new Map();
+    const streamable = getStreamableExtractors(player);
+
+    if (!streamable.length) return results;
 
     // Search all sources in parallel, keeping the priority order in the result map
     const searches = await Promise.all(streamable.map(async (extractor) => {
@@ -689,6 +734,8 @@ module.exports = {
     downloadTrackDirectly,
     downloadTrackWithFfmpeg,
     searchAcrossExtractors,
+    findStreamableMatch,
+    isStreamableTrack,
     createSourcePageEmbed,
     ensureDownloadDir,
     sanitizeFilename,
