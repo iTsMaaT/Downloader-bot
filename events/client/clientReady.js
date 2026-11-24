@@ -68,9 +68,25 @@ module.exports = {
         console.log(`There is ${client.options.shardCount} shard${client.options.shardCount > 1 ? "s" : ""} spawned`);
         config.set("SUPERUSER_WHITELIST", [...config.get("SUPERUSER_WHITELIST"), process.env.OWNER_ID]);
         console.log(`Whitelisted users: ${config.get("SUPERUSER_WHITELIST").join(", ")}`);
-        if (process.env.SERVER == "dev") config.set("defaultSuperuserState", true);
+        // SUPERUSER_MODE=on|off overrides the default (dev = on, prod = config value),
+        // e.g. SERVER=dev + SUPERUSER_MODE=off to let other people test the dev bot
+        const superuserMode = process.env.SUPERUSER_MODE?.trim().toLowerCase();
+        let superuserReason;
+        if (["on", "true"].includes(superuserMode)) {
+            config.set("defaultSuperuserState", true);
+            superuserReason = "SUPERUSER_MODE=on";
+        } else if (["off", "false"].includes(superuserMode)) {
+            config.set("defaultSuperuserState", false);
+            superuserReason = "SUPERUSER_MODE=off";
+        } else if (process.env.SERVER == "dev") {
+            config.set("defaultSuperuserState", true);
+            superuserReason = "SERVER=dev";
+        } else {
+            superuserReason = `SERVER=${process.env.SERVER}, config default`;
+        }
         console.log(`Debug is ${config.get("defaultDebugState") ? "en" : "dis"}abled`);
-        console.log(`Superuser is ${config.get("defaultSuperuserState") ? "en" : "dis"}abled`);
+        // Values from the host's environment (e.g. panel startup variables) take precedence over .env
+        console.log(`Superuser is ${config.get("defaultSuperuserState") ? "en" : "dis"}abled (${superuserReason})`);
 
         if (config.get("LIVE_UPDATE_CHANNEL_ID")) {
             console.log("Starting LiveUpdatingBotStats...");
