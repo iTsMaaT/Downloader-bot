@@ -85,7 +85,8 @@ module.exports = {
                 return;
             }
 
-            await interaction.deferReply(); // Defer reply AFTER permission checks
+            // Defer reply AFTER permission checks
+            await interaction.deferReply(slash.ephemeral ? { flags: MessageFlags.Ephemeral } : undefined);
 
             // Check voice channel permissions if needed
             if (slash?.inVoiceChannel || slash?.inSameVoiceChannel) {
